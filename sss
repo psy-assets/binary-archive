@@ -1,0 +1,678 @@
+#!/usr/bin/env bash
+# NAME:  GNOS sockets
+# DESC:  Handy ss wrapper
+# FEAT:  IPv4/IPv6, TCP/UDP/raw, ANSI colors, literal filtering
+# DEPS:  ss awk
+
+set -Eeuo pipefail
+export LC_ALL=C
+
+function gnos_sockets() (
+	{ #helpers
+		__help() {
+			printf "%b\n" \
+				"${aarr_color[bold_yellow]}GNOS-Sockets${aarr_color[reset]}" \
+				"" \
+				"${aarr_color[bold_underline_yellow]}Usage:${aarr_color[reset]}" \
+				"  ${aarr_config[program]} [options] [--] [PATTERN]" \
+				"" \
+				"${aarr_color[bold_underline_yellow]}Options:${aarr_color[reset]}" \
+				"  -h, --help            <boolean?>   Display this help information." \
+				"  -4, --ipv4            <boolean?>   Display IPv4 sockets." \
+				"  -6, --ipv6            <boolean?>   Display IPv6 sockets." \
+				"  -t, --tcp             <boolean?>   Display TCP sockets." \
+				"  -u, --udp             <boolean?>   Display UDP sockets." \
+				"  -l, --listen          <boolean?>   Display listening sockets only." \
+				"  -L, --non-listen      <boolean?>   Display non-listening sockets only." \
+				"  -s, --short           <boolean?>   Display shortened/local IP notation." \
+				"  -N, --resolve         <boolean?>   Resolve host and service names." \
+				"" \
+				"${aarr_color[bold_underline_yellow]}Arguments:${aarr_color[reset]}" \
+				"  PATTERN               <string?>    Case-sensitive literal text match." \
+				"" \
+				"${aarr_color[bold_underline_yellow]}Sort:${aarr_color[reset]}" \
+				"  PROCESS A-Z, unknown process (:) last; USER breaks ties." \
+				"" \
+				"${aarr_color[bold_underline_yellow]}Examples:${aarr_color[reset]}" \
+				"  ${aarr_config[program]} -4 -t -l" \
+				"  ${aarr_config[program]} --ipv6 --tcp --short" \
+				"  ${aarr_config[program]} -t -u -- ESTAB" \
+				"  ${aarr_config[program]} -- '-pattern-starting-with-dash'"
+
+			exit 0
+		}
+
+		config_parse_args() {
+			OPTIND=1
+
+			while getopts ':-:h46tulLsN' opt; do
+				case "${opt}" in
+				h) __help ;;
+				4) aarr_flag[ipv4]=1 ;;
+				6) aarr_flag[ipv6]=1 ;;
+				t) aarr_flag[tcp]=1 aarr_flag[protocol_selected]=1 ;;
+				u) aarr_flag[udp]=1 aarr_flag[protocol_selected]=1 ;;
+				l) aarr_flag[listen]=1 ;;
+				L) aarr_flag[nonlisten]=1 ;;
+				s) aarr_flag[short_ip]=1 ;;
+				N) aarr_flag[numeric]=0 ;;
+				-)
+					case "${OPTARG}" in
+					help) __help ;;
+					ipv4) aarr_flag[ipv4]=1 ;;
+					ipv6) aarr_flag[ipv6]=1 ;;
+					tcp) aarr_flag[tcp]=1 aarr_flag[protocol_selected]=1 ;;
+					udp) aarr_flag[udp]=1 aarr_flag[protocol_selected]=1 ;;
+					listen) aarr_flag[listen]=1 ;;
+					non-listen | non-listening) aarr_flag[nonlisten]=1 ;;
+					short) aarr_flag[short_ip]=1 ;;
+					resolve) aarr_flag[numeric]=0 ;;
+					numeric) aarr_flag[numeric]=1 ;;
+					*) __throw_error "Unknown long option: \"--${OPTARG}\"." && return 1 ;;
+					esac
+					;;
+				:) __throw_error "Option \"-${OPTARG:-}\" requires an argument." && return 1 ;;
+				\?) __throw_error "Invalid option \"-${OPTARG:-}\"." && return 1 ;;
+				*) __throw_error "Unknown option \"-${OPTARG:-}\"." && return 1 ;;
+				esac
+			done
+
+			shift "$((OPTIND - 1))"
+
+			if (($# > 1)); then
+				__throw_error 'Only one PATTERN argument is supported.'
+				return 1
+			fi
+
+			aarr_config[pattern]="${1:-}"
+		}
+
+		:
+
+		__throw_error() {
+			declare message="${1:-Unknown error.}"
+			declare status="${2:-1}"
+
+			printf '%b%s%b: %s\n' \
+				"${aarr_color[bold_red]}" \
+				"${aarr_config[program]}" \
+				"${aarr_color[reset]}" \
+				"${message}" >&2
+
+			return "${status}"
+		}
+
+		__require_command() {
+			declare command_name="${1:?}"
+
+			if ! command -v "${command_name}" >/dev/null 2>&1; then
+				__throw_error "Required command not found: \"${command_name}\"."
+				return 1
+			fi
+		}
+
+		__set_ansi() {
+			if [[ -t 1 ]] && [[ "${TERM:-}" != 'dumb' ]] && [[ -z "${NO_COLOR:-}" ]]; then
+				aarr_flag[colors]=1
+
+				printf -v 'aarr_color[reset]' '\e[0m'
+				printf -v 'aarr_color[bold]' '\e[1m'
+				printf -v 'aarr_color[red]' '\e[31m'
+				printf -v 'aarr_color[green]' '\e[32m'
+				printf -v 'aarr_color[yellow]' '\e[33m'
+				printf -v 'aarr_color[blue]' '\e[34m'
+				printf -v 'aarr_color[bold_red]' '\e[1;31m'
+				printf -v 'aarr_color[bold_yellow]' '\e[1;93m'
+				printf -v 'aarr_color[bold_underline_yellow]' '\e[1;4;93m'
+			fi
+		}
+	}
+
+	{ #utilities
+		gs__main() {
+			GNOS_PATTERN="${aarr_config[pattern]}" awk \
+				-v mode="${aarr_config[mode]}" \
+				-v force_proto="${aarr_config[force_proto]}" \
+				-v short_ip="${aarr_flag[short_ip]}" \
+				-v colors="${aarr_flag[colors]}" \
+				-v current_user="${SUDO_USER:-${USER:-}}" \
+				-v expected_sources="${#iarr_ss_inputs[@]}" \
+				"${aarr_runtime[awk_program]}" \
+				"${iarr_ss_inputs[@]}"
+		}
+
+		:
+
+		gs__validate_dependencies() {
+			declare command_name=""
+
+			for command_name in "${iarr_required_commands[@]}"; do
+				__require_command "${command_name}"
+			done
+		}
+
+		gs__configure() {
+			{ #address-families
+				if ((!aarr_flag[ipv4] && !aarr_flag[ipv6])); then
+					aarr_flag[ipv4]=1
+					aarr_flag[ipv6]=1
+				fi
+			}
+
+			{ #socket-mode
+				if ((aarr_flag[listen] && !aarr_flag[nonlisten])); then
+					aarr_config[mode]='listen'
+				elif ((aarr_flag[nonlisten] && !aarr_flag[listen])); then
+					aarr_config[mode]='nonlisten'
+				else
+					aarr_config[mode]='all'
+				fi
+			}
+
+			{ #ss-options
+				if ((aarr_flag[numeric])); then
+					iarr_ss_options+=(--numeric)
+				else
+					iarr_ss_options+=(--resolve)
+				fi
+
+				case "${aarr_config[mode]}" in
+				all) iarr_ss_options+=(--all) ;;
+				listen) iarr_ss_options+=(--listen) ;;
+				nonlisten) : ;;
+				*) __throw_error "Internal error: invalid socket mode \"${aarr_config[mode]}\"." && return 1 ;;
+				esac
+
+				if ((aarr_flag[protocol_selected])); then
+					((aarr_flag[tcp])) && iarr_ss_options+=(--tcp)
+					((aarr_flag[udp])) && iarr_ss_options+=(--udp)
+
+					if ((aarr_flag[tcp] && !aarr_flag[udp])); then
+						aarr_config[force_proto]='tcp'
+					elif ((aarr_flag[udp] && !aarr_flag[tcp])); then
+						aarr_config[force_proto]='udp'
+					fi
+				else
+					if [[ "${aarr_config[mode]}" == 'nonlisten' ]]; then
+						iarr_ss_options+=(--tcp --udp)
+					else
+						iarr_ss_options+=(--tcp --udp --raw)
+					fi
+				fi
+			}
+		}
+
+		gs__build_awk_program() {
+			# shellcheck disable=SC2016
+			aarr_runtime[awk_program]='
+				BEGIN {
+					unknown=":"
+					pattern=ENVIRON["GNOS_PATTERN"]
+					family=0
+
+					ansi["reset"]="\033[0m"
+					ansi["red"]="\033[31m"
+					ansi["green"]="\033[32m"
+					ansi["yellow"]="\033[33m"
+					ansi["blue"]="\033[34m"
+					ansi["bold"]="\033[1m"
+
+					while ((getline passwd_line < "/etc/passwd") > 0) {
+						passwd_count=split(passwd_line, passwd_fields, ":")
+						if (passwd_count >= 3 && passwd_fields[3] ~ /^[0-9]+$/) {
+							uid_name[passwd_fields[3]+0]=passwd_fields[1]
+						}
+					}
+					close("/etc/passwd")
+
+					columns=(mode == "listen" ? 6 : 7)
+					header[1]="USER"
+					header[2]="PROCESS"
+					header[3]="PID"
+					header[4]="PROTO"
+					header[5]="LOCAL"
+					if (mode == "listen") {
+						header[6]="STATE"
+					} else {
+						header[6]="REMOTE"
+						header[7]="STATE"
+					}
+				}
+
+				/^__GNOS_FAMILY__=[46]$/ {
+					family=substr($0, length($0)) + 0
+					next
+				}
+
+				/^__GNOS_STATUS__=[46]:[0-9]+$/ {
+					split($0, status_fields, /[=:]/)
+					status_count++
+					if (status_fields[3]+0 != 0) ss_failed=1
+					next
+				}
+
+				NF == 0 { next }
+
+				{
+					if (family != 4 && family != 6) next
+
+					if (force_proto != "") {
+						proto=force_proto
+						state=$1
+						local_endpoint=$4
+						remote_endpoint=$5
+					} else {
+						proto=$1
+						state=$2
+						local_endpoint=$5
+						remote_endpoint=$6
+					}
+
+					if (proto == "tcp" || proto == "udp") {
+						display_proto=proto (family == 6 ? "6" : "")
+						nolport=0
+					} else {
+						display_proto=proto
+						nolport=1
+					}
+
+					local_addr=endpoint_addr(local_endpoint)
+					local_port=(nolport ? "" : endpoint_port(local_endpoint))
+					remote_addr=endpoint_addr(remote_endpoint)
+					remote_port=(nolport ? "" : endpoint_port(remote_endpoint))
+
+					owner=unknown
+					process_name=unknown
+					pid=unknown
+					uid_number=""
+
+					if (match($0, /users:\(\("[^"]+"/)) {
+						process_name=substr($0, RSTART, RLENGTH)
+						sub(/^users:\(\("/, "", process_name)
+						sub(/"$/, "", process_name)
+					}
+
+					if (match($0, /pid=[0-9]+/)) {
+						pid=substr($0, RSTART+4, RLENGTH-4)
+					}
+
+					if (match($0, /uid:[0-9]+/)) {
+						uid_number=substr($0, RSTART+4, RLENGTH-4)
+						if (uid_name[uid_number+0] != "") {
+							owner=uid_name[uid_number+0]
+						} else {
+							owner=uid_number
+						}
+					}
+
+					no_peer=(state == "LISTEN" || state == "UNCONN")
+					if (no_peer) {
+						remote_addr=""
+						remote_port=""
+					}
+
+					local_display=endpoint_display(local_addr, local_port, nolport, 0)
+					remote_display=(no_peer ? ":" : endpoint_display(remote_addr, remote_port, nolport, 0))
+
+					if (mode == "listen") {
+						raw=owner " " process_name " " pid " " display_proto " " local_display " " state
+					} else {
+						raw=owner " " process_name " " pid " " display_proto " " local_display " " remote_display " " state
+					}
+
+					if (pattern != "" && index(raw, pattern) == 0) next
+
+					row_count++
+					row_owner[row_count]=owner
+					row_process[row_count]=process_name
+					row_pid[row_count]=pid
+					row_proto[row_count]=display_proto
+					row_laddr[row_count]=local_addr
+					row_lport[row_count]=local_port
+					row_raddr[row_count]=remote_addr
+					row_rport[row_count]=remote_port
+					row_state[row_count]=state
+					row_no_peer[row_count]=no_peer
+					row_nolport[row_count]=nolport
+
+					normalized=normalize_addr(local_addr)
+					if (normalized != "" && normalized != "*" && normalized != "0.0.0.0" && normalized != "::") {
+						local_address[normalized]=1
+					}
+				}
+
+				END {
+					if (ss_failed || status_count != expected_sources) exit 1
+
+					for (row=1; row<=row_count; row++) order[row]=row
+					stable_sort_rows()
+
+					for (field=1; field<=columns; field++) width[field]=length(header[field])
+
+					for (position=1; position<=row_count; position++) {
+						row=order[position]
+						owner=row_owner[row]
+						process_name=row_process[row]
+						pid=row_pid[row]
+						display_proto=row_proto[row]
+						state=row_state[row]
+
+						if (colors) {
+							owner=color_user(owner)
+							display_proto=color_proto(display_proto)
+							state=color_state(state)
+						}
+
+						local_display=endpoint_display(row_laddr[row], row_lport[row], row_nolport[row], colors)
+						remote_display=(row_no_peer[row] ? ":" : endpoint_display(row_raddr[row], row_rport[row], row_nolport[row], colors))
+
+						cell[position, 1]=owner
+						cell[position, 2]=process_name
+						cell[position, 3]=pid
+						cell[position, 4]=display_proto
+						cell[position, 5]=local_display
+
+						if (mode == "listen") {
+							cell[position, 6]=state
+						} else {
+							cell[position, 6]=remote_display
+							cell[position, 7]=state
+						}
+
+						for (field=1; field<=columns; field++) {
+							size=visible_length(cell[position, field])
+							if (size > width[field]) width[field]=size
+						}
+					}
+
+					for (field=1; field<=columns; field++) {
+						value=(colors ? ansi["bold"] header[field] ansi["reset"] : header[field])
+						print_cell(value, width[field], field == columns)
+					}
+					printf "\n"
+
+					for (position=1; position<=row_count; position++) {
+						for (field=1; field<=columns; field++) {
+							print_cell(cell[position, field], width[field], field == columns)
+						}
+						printf "\n"
+					}
+				}
+
+				function stable_sort_rows() {
+					if (row_count > 1) merge_sort(1, row_count)
+				}
+
+				function merge_sort(left, right, middle) {
+					if (left >= right) return
+
+					middle=int((left+right)/2)
+					merge_sort(left, middle)
+					merge_sort(middle+1, right)
+					merge_rows(left, middle, right)
+				}
+
+				function merge_rows(left, middle, right, i, j, k) {
+					i=left
+					j=middle+1
+					k=left
+
+					while (i <= middle && j <= right) {
+						if (row_after(order[i], order[j])) {
+							merge_tmp[k++]=order[j++]
+						} else {
+							merge_tmp[k++]=order[i++]
+						}
+					}
+
+					while (i <= middle) merge_tmp[k++]=order[i++]
+					while (j <= right) merge_tmp[k++]=order[j++]
+
+					for (k=left; k<=right; k++) order[k]=merge_tmp[k]
+				}
+
+				function row_after(left, right, lp, rp, lu, ru, llocal, rlocal) {
+					lp=row_process[left]
+					rp=row_process[right]
+
+					if (lp == unknown && rp != unknown) return 1
+					if (lp != unknown && rp == unknown) return 0
+
+					lp=tolower(lp)
+					rp=tolower(rp)
+					if (lp != rp) return lp > rp
+
+					lu=row_owner[left]
+					ru=row_owner[right]
+					if (lu == unknown && ru != unknown) return 1
+					if (lu != unknown && ru == unknown) return 0
+
+					lu=tolower(lu)
+					ru=tolower(ru)
+					if (lu != ru) return lu > ru
+
+					if (row_proto[left] != row_proto[right]) return row_proto[left] > row_proto[right]
+
+					llocal=row_laddr[left] ":" row_lport[left]
+					rlocal=row_laddr[right] ":" row_lport[right]
+					if (llocal != rlocal) return llocal > rlocal
+
+					return 0
+				}
+
+				function endpoint_port(endpoint, position) {
+					if (endpoint ~ /^\[/) {
+						position=index(endpoint, "]:")
+						if (position) return substr(endpoint, position+2)
+						return ""
+					}
+
+					if (match(endpoint, /:[^:]*$/)) return substr(endpoint, RSTART+1)
+					return ""
+				}
+
+				function endpoint_addr(endpoint, address, position) {
+					address=endpoint
+
+					if (address ~ /^\[/) {
+						position=index(address, "]:")
+						if (position) address=substr(address, 1, position)
+					} else if (match(address, /:[^:]*$/)) {
+						address=substr(address, 1, RSTART-1)
+					}
+
+					address=strip_scope(address)
+
+					if (short_ip) {
+						address=normalize_addr(address)
+						if (substr(address, 1, 7) == "::ffff:") address=substr(address, 8)
+
+						if (address == "*" || address == "0.0.0.0" || address == "::") {
+							address="0"
+						} else if (substr(address, 1, 4) == "127." || address == "::1" || address == "localhost") {
+							address="1"
+						}
+					}
+
+					return address
+				}
+
+				function strip_scope(address) {
+					if (address ~ /^\[/) {
+						sub(/%[^]]+\]/, "]", address)
+					} else {
+						sub(/%.*/, "", address)
+					}
+					return address
+				}
+
+				function normalize_addr(address, normalized) {
+					normalized=address
+					if (substr(normalized, 1, 1) == "[" && substr(normalized, length(normalized), 1) == "]") {
+						normalized=substr(normalized, 2, length(normalized)-2)
+					}
+					return normalized
+				}
+
+				function endpoint_display(address, port, no_port, use_color, display) {
+					display=(use_color ? color_ip(address) : address)
+
+					if (no_port) return display ":"
+					if (port == "") return display
+					return display ":" port
+				}
+
+				function color_ip(address, normalized, prefix, suffix) {
+					normalized=normalize_addr(address)
+					prefix=""
+					suffix=""
+
+					if (address ~ /^\[/) {
+						prefix="["
+						suffix="]"
+					}
+
+					if (normalized == "0") return prefix ansi["red"] normalized ansi["reset"] suffix
+					if (normalized == "1" || normalized == "localhost" || substr(normalized, 1, 4) == "127.") {
+						return prefix ansi["green"] normalized ansi["reset"] suffix
+					}
+					if (normalized == "*" || normalized == "0.0.0.0" || normalized == "::") {
+						return prefix ansi["red"] normalized ansi["reset"] suffix
+					}
+					if (local_address[normalized] == 1) return prefix ansi["blue"] normalized ansi["reset"] suffix
+					return prefix ansi["yellow"] normalized ansi["reset"] suffix
+				}
+
+				function color_proto(value, base) {
+					base=value
+					sub(/6$/, "", base)
+					if (base == "tcp") return ansi["green"] value ansi["reset"]
+					if (base == "udp") return ansi["blue"] value ansi["reset"]
+					return ansi["yellow"] value ansi["reset"]
+				}
+
+				function color_user(value) {
+					if (value == "root") return ansi["red"] value ansi["reset"]
+					if (current_user != "" && value == current_user) return ansi["green"] value ansi["reset"]
+					if (value == unknown) return value
+					return ansi["yellow"] value ansi["reset"]
+				}
+
+				function color_state(value) {
+					if (value == "LISTEN") return ansi["red"] value ansi["reset"]
+					if (value == "ESTAB") return ansi["green"] value ansi["reset"]
+					if (value == "UNCONN") return ansi["blue"] value ansi["reset"]
+					return ansi["yellow"] value ansi["reset"]
+				}
+
+				function visible_length(value, plain) {
+					plain=value
+					gsub(/\033\[[0-9;]*m/, "", plain)
+					return length(plain)
+				}
+
+				function print_cell(value, target_width, last, padding) {
+					printf "%s", value
+					if (last) return
+
+					padding=target_width-visible_length(value)+2
+					while (padding-- > 0) printf " "
+				}
+			'
+		}
+
+		gs__open_ss_stream() {
+			declare family="${1:?}"
+			declare -i stream_fd=-1
+
+			exec {stream_fd}< <(
+				declare -i ss_status=0
+
+				printf '__GNOS_FAMILY__=%s\n' "${family}"
+				ss "${iarr_ss_options[@]}" "--ipv${family}" || ss_status=$?
+				printf '__GNOS_STATUS__=%s:%s\n' "${family}" "${ss_status}"
+			)
+
+			aarr_runtime["ss_fd_${family}"]="${stream_fd}"
+			iarr_ss_inputs+=("/dev/fd/${stream_fd}")
+		}
+
+		gs__prepare_ss_output() {
+			declare \
+				family="" \
+				family_key=""
+
+			iarr_ss_inputs=()
+
+			for family in 4 6; do
+				printf -v family_key 'ipv%s' "${family}"
+				((aarr_flag[${family_key}])) || continue
+				gs__open_ss_stream "${family}"
+			done
+		}
+	}
+
+	{ #variables
+		declare -i OPTIND=1
+		declare opt=""
+
+		declare -A aarr_flag=(
+			[ipv4]=0
+			[ipv6]=0
+			[tcp]=0
+			[udp]=0
+			[protocol_selected]=0
+			[listen]=0
+			[nonlisten]=0
+			[numeric]=1
+			[short_ip]=0
+			[colors]=0
+		)
+
+		declare -A aarr_config=(
+			[program]="${0##*/}"
+			[pattern]=""
+			[mode]='all'
+			[force_proto]=""
+		)
+
+		declare -A aarr_color=(
+			[reset]=""
+			[bold]=""
+			[red]=""
+			[green]=""
+			[yellow]=""
+			[blue]=""
+			[bold_red]=""
+			[bold_yellow]=""
+			[bold_underline_yellow]=""
+		)
+
+		declare -A aarr_runtime=(
+			[awk_program]=""
+			[ss_fd_4]=""
+			[ss_fd_6]=""
+		)
+
+		declare -a \
+			iarr_ss_options=(--no-header --extended --processes) \
+			iarr_ss_inputs=() \
+			iarr_required_commands=(ss awk)
+	}
+
+	{ #setting-variables
+		__set_ansi
+		config_parse_args "${@}"
+
+		gs__validate_dependencies
+		gs__configure
+		gs__build_awk_program
+		gs__prepare_ss_output
+	}
+
+	:
+
+	gs__main "${@}"
+)
+
+gnos_sockets "${@}"
