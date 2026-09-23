@@ -26,6 +26,8 @@ function gnos_sockets() (
 				"  -L, --non-listen      <boolean?>   Display non-listening sockets only." \
 				"  -s, --short           <boolean?>   Display shortened/local IP notation." \
 				"  -N, --resolve         <boolean?>   Resolve host and service names." \
+				"  -c, --color           <boolean?>   Force ANSI color output." \
+				"  -v, --version         <boolean?>   Display version information." \
 				"" \
 				"${aarr_color[bold_underline_yellow]}Arguments:${aarr_color[reset]}" \
 				"  PATTERN               <string?>    Case-sensitive literal text match." \
@@ -42,10 +44,18 @@ function gnos_sockets() (
 			exit 0
 		}
 
+		__version() {
+			printf "%s %s\n" \
+				"${aarr_config[name]}" \
+				"${aarr_config[version]}"
+
+			exit 0
+		}
+
 		config_parse_args() {
 			OPTIND=1
 
-			while getopts ':-:h46tulLsN' opt; do
+			while getopts ':-:h46tulLsNcv' opt; do
 				case "${opt}" in
 				h) __help ;;
 				4) aarr_flag[ipv4]=1 ;;
@@ -56,6 +66,8 @@ function gnos_sockets() (
 				L) aarr_flag[nonlisten]=1 ;;
 				s) aarr_flag[short_ip]=1 ;;
 				N) aarr_flag[numeric]=0 ;;
+				c) aarr_flag[force_color]=1 && __set_ansi ;;
+				v) __version ;;
 				-)
 					case "${OPTARG}" in
 					help) __help ;;
@@ -68,6 +80,8 @@ function gnos_sockets() (
 					short) aarr_flag[short_ip]=1 ;;
 					resolve) aarr_flag[numeric]=0 ;;
 					numeric) aarr_flag[numeric]=1 ;;
+					color) aarr_flag[force_color]=1 && __set_ansi ;;
+					version) __version ;;
 					*) __throw_error "Unknown long option: \"--${OPTARG}\"." && return 1 ;;
 					esac
 					;;
@@ -112,7 +126,7 @@ function gnos_sockets() (
 		}
 
 		__set_ansi() {
-			if [[ -t 1 ]] && [[ "${TERM:-}" != 'dumb' ]] && [[ -z "${NO_COLOR:-}" ]]; then
+			if ((aarr_flag[force_color])) || { [[ -t 1 ]] && [[ "${TERM:-}" != 'dumb' ]] && [[ -z "${NO_COLOR:-}" ]]; }; then
 				aarr_flag[colors]=1
 
 				printf -v 'aarr_color[reset]' '\e[0m'
@@ -627,9 +641,12 @@ function gnos_sockets() (
 			[numeric]=1
 			[short_ip]=0
 			[colors]=0
+			[force_color]=0
 		)
 
 		declare -A aarr_config=(
+			[name]="gnos-sockets"
+			[version]="v1.0.0"
 			[program]="${0##*/}"
 			[pattern]=""
 			[mode]='all'
